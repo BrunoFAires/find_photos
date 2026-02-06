@@ -13,8 +13,8 @@ def parse_args():
     parser.add_argument("--start_name", type=str, default=None)
     parser.add_argument("--max_faces", type=int, default=15)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--device", choices=["cpu", "cuda"] ,default="cuda")
     return parser.parse_args()
-
 
 def load_image(path, max_size=1600):
     img = Image.open(path).convert("RGB")
@@ -26,10 +26,27 @@ def load_image(path, max_size=1600):
 
     return img
 
-def process_image(args):
-    """
-    Executado em PROCESSO separado
-    """
+
+def list_images(input_dir: Path):
+    files = sorted(
+        [p for p in input_dir.iterdir()
+         if p.suffix.lower() in {".jpg", ".jpeg", ".png"}],
+        key=lambda p: p.name
+    )
+
+    if not files:
+        raise RuntimeError("No images found")
+
+    return files
+
+
+def load_existing_results(output_path: Path):
+    if output_path.exists():
+        with open(output_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def process_image_cpu(args):
     image_path, max_faces = args
 
     device = torch.device("cpu")
@@ -74,27 +91,11 @@ def process_image(args):
         }]
 
 
-def list_images(input_dir):
-    files = sorted(
-        [p for p in input_dir.iterdir()
-         if p.suffix.lower() in {".jpg", ".jpeg", ".png"}],
-        key=lambda p: p.name
-    )
-
-    if not files:
-        raise RuntimeError("No images found")
-
-    return files
-
-
-def load_existing_results(output_path):
-    if output_path.exists():
-        with open(output_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
-
 def main():
     args = parse_args()
+
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA selected but no GPU available")
 
     input_dir = Path(args.input_dir)
     files = list_images(input_dir)
@@ -108,17 +109,64 @@ def main():
 
     files = files[start_idx:]
     print(f"Starting from: {files[0].name}")
-    print(f"Workers: {args.workers}")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     results = load_existing_results(output_path)
+    if args.device == "cuda":
+        print("Running on GPU (no parallelism)")
+
+        device = torch.device("cuda")
+
+        mtcnn = MTCNN(
+            image_size=160,
+            margin=40,
+            keep_all=True,
+            device=device
+        )
+
+        facenet = InceptionResnetV1(
+            pretrained="vggface2"
+        ).eval().to(device)
+
+        for idx, path in enumerate(files):
+            print(f"[{idx}] Processing {path.name}")
+
+            try:
+                img = load_image(path)
+                faces = mtcnn(img)
+
+                if faces is None:
+                    continue
+
+                faces = faces[:args.max_faces].to(device)
+
+                with torch.no_grad():
+                    emb = facenet(faces)
+
+                for face_idx, e in enumerate(emb):
+                    results.append({
+                        "image": path.name,
+                        "face_index": face_idx,
+                        "embedding": e.cpu().numpy().tolist()
+                    })
+
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(results, f)
+
+            except Exception as e:
+                print(f"Error processing {path.name}: {e}")
+
+        print("Done.")
+        return
+    
+    print(f"Running on CPU (parallel) | workers={args.workers}")
 
     tasks = [(p, args.max_faces) for p in files]
 
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = [executor.submit(process_image, t) for t in tasks]
+        futures = [executor.submit(process_image_cpu, t) for t in tasks]
 
         for future in as_completed(futures):
             res = future.result()

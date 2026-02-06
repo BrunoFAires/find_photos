@@ -1,21 +1,25 @@
 # Find Photos Pipeline
 
-Este projeto implementa um pipeline completo para:
+Este projeto implementa um pipeline completo para **processamento, indexação e recuperação de fotos com base em reconhecimento facial**, usando **FaceNet (facenet-pytorch)**.
+
+Funcionalidades principais:
 
 1. **Baixar fotos em lote** a partir de um arquivo JSON (`images_source.json`)
-2. **Gerar embeddings faciais** para todas as faces detectadas nas imagens usando **FaceNet (facenet-pytorch)**
+2. **Gerar embeddings faciais** para todas as faces detectadas nas imagens
+3. **Encontrar fotos de uma pessoa específica** usando imagens de referência
+4. **Baixar automaticamente apenas as fotos selecionadas**
 
 O pipeline foi projetado para:
 
 - Grandes volumes de imagens
-- Execução incremental (retomar de onde parou)
 - Múltiplas faces por imagem
-- Uso por várias pessoas/máquinas
+- Uso em CPU (com paralelismo) ou GPU
+- Reutilização dos embeddings sem recomputar
 
 ## Requisitos
 
 - Python **3.10+** (testado em 3.12)
-- GPU opcional
+- GPU opcional (CUDA acelera bastante, mas CPU funciona)
 
 Instale as dependências:
 
@@ -77,11 +81,7 @@ python download_images.py \
 | `--type` | `original` ou `thumb` |
 | `--workers` | Quantidade de downloads paralelos |
 
-### Comportamento importante
-
-- Imagens já existentes são ignoradas
-- O download pode ser interrompido e retomado
-- Ordem baseada no `filename`
+Downloads já existentes são ignorados e o processo pode ser retomado.
 
 ## 2. Criar embeddings faciais
 
@@ -91,14 +91,15 @@ Este passo:
 - Gera um embedding por face
 - Salva tudo em um arquivo JSON incremental
 
-### Executar geração de embeddings
+### Executar geração de embeddings (CPU em paralelo)
 
 ```bash
-python generate_embeddings.py \
+python generate_embeddings_parallel.py \
   --input_dir imagens \
   --output embeddings.json \
-  --start_name CCF252_07937 \
-  --max_faces 15
+  --start_name CCF252_07937.jpg \
+  --max_faces 15 \
+  --workers 6
 ```
 
 ### Argumentos
@@ -109,6 +110,7 @@ python generate_embeddings.py \
 | `--output` | Arquivo JSON de saída |
 | `--start_name` | Nome da imagem inicial (ordem alfabética) |
 | `--max_faces` | Número máximo de faces por imagem |
+| `--workers` | Número de processos paralelos (recomendado: 4-8) |
 
 ### Formato do `embeddings.json`
 
@@ -133,7 +135,60 @@ python generate_embeddings.py \
 
 O arquivo é salvo incrementalmente a cada imagem processada, evitando corrupção em caso de interrupção.
 
-## Fluxo recomendado
+## 3. Encontrar e baixar fotos de uma pessoa
+
+Este passo permite:
+
+- Usar uma ou mais imagens de referência
+- Encontrar todas as fotos onde a pessoa aparece
+- Baixar somente as fotos correspondentes
+
+Nenhum embedding é recalculado.
+
+### Estrutura esperada
+
+```
+reference/
+  ├─ ref1.jpg
+  ├─ ref2.jpg
+
+embeddings.json
+images_source.json
+```
+
+### Executar busca e download das fotos correspondentes
+
+```bash
+python find_images.py \
+  --reference_dir reference \
+  --embeddings embeddings.json \
+  --images_source images_source.json \
+  --output_dir matched \
+  --threshold 0.8 \
+  --type original \
+  --workers 8
+```
+
+### O que o script faz
+
+1. Gera um embedding médio a partir das imagens em `reference/`
+2. Compara esse embedding com todas as faces em `embeddings.json`
+3. Seleciona as imagens cuja similaridade ≥ threshold
+4. Baixa automaticamente apenas essas imagens
+
+### Argumentos principais
+
+| Argumento | Descrição |
+|-----------|-----------|
+| `--reference_dir` | Pasta com imagens da pessoa de referência |
+| `--embeddings` | Arquivo com embeddings pré-gerados |
+| `--images_source` | Fonte das URLs |
+| `--output_dir` | Pasta de saída das imagens encontradas |
+| `--threshold` | Similaridade mínima (ex: 0.75–0.85) |
+| `--type` | `original` ou `thumb` |
+| `--workers` | Downloads paralelos |
+
+## Fluxo completo recomendado
 
 ```
 images_source.json
@@ -142,7 +197,11 @@ download_images.py
         ↓
 pasta imagens/
         ↓
-generate_embeddings.py
+generate_embeddings_parallel.py
         ↓
 embeddings.json
+        ↓
+find_images.py
+        ↓
+matched/
 ```

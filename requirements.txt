@@ -1,0 +1,5 @@
+torch>=2.0
+torchvision>=0.15
+facenet-pytorch>=2.5.3
+pillow>=9.5
+numpy>=1.23

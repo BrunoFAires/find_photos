@@ -1,113 +1,141 @@
 import json
+import argparse
+import requests
 import shutil
 from pathlib import Path
 import torch
 import numpy as np
 from PIL import Image
 from facenet_pytorch import MTCNN, InceptionResnetV1
-from numpy.linalg import norm
 
-# ================== CONFIG ==================
-REFERENCE_IMAGE = "reference/1.png"
-EMBEDDINGS_JSON = "embeddings.json"
-INPUT_IMAGES_DIR = "imagens"
-OUTPUT_DIR = "output"
-SIMILARITY_THRESHOLD = 0.7
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reference_dir", default="reference")
+    parser.add_argument("--embeddings", default="embeddings.json")
+    parser.add_argument("--images_source", default="images_source.json")
+    parser.add_argument("--output_dir", default="output/matched")
+    parser.add_argument("--threshold", type=float, default=0.8)
+    parser.add_argument("--type", choices=["original", "thumb"], default="original")
+    parser.add_argument("--workers", type=int, default=8)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ================== MODELS ==================
-mtcnn = MTCNN(
-    image_size=160,
-    margin=40,
-    keep_all=True,
-    device=device
-)
-
-facenet = InceptionResnetV1(
-    pretrained="vggface2"
-).eval().to(device)
-
-# ================== HELPERS ==================
-def load_image(path, max_size=1600):
-    img = Image.open(path).convert("RGB")
-    w, h = img.size
-
-    if max(w, h) > max_size:
-        scale = max_size / max(w, h)
-        img = img.resize((int(w * scale), int(h * scale)))
-
-    return img
-
-
-def get_embeddings(image_path):
-    img = load_image(image_path)
-    faces = mtcnn(img)
-
-    if faces is None:
-        return np.empty((0, 512))
-
-    faces = faces.to(device)
-
-    with torch.no_grad():
-        embeddings = facenet(faces)
-
-    return embeddings.cpu().numpy()
-
+    return parser.parse_args()
 
 def cosine_similarity(a, b):
-    return np.dot(a, b) / (norm(a) * norm(b))
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
-# ================== LOAD EMBEDDINGS ==================
-with open(EMBEDDINGS_JSON, "r", encoding="utf-8") as f:
-    stored = json.load(f)
+def build_reference_embedding(ref_dir, device):
+    mtcnn = MTCNN(image_size=160, margin=20, device=device)
+    facenet = InceptionResnetV1(pretrained="vggface2").eval().to(device)
 
-stored_embeddings = np.array([item["embedding"] for item in stored])
-print(f"Loaded {len(stored)} stored embeddings")
-print("ultima imagem:", stored[-1]["image"])
-# ================== REFERENCE ==================
-print("Generating reference embedding(s)...")
+    embeddings = []
 
-ref_embeddings = get_embeddings(REFERENCE_IMAGE)
+    for img_path in Path(ref_dir).iterdir():
+        if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+            continue
 
-if len(ref_embeddings) == 0:
-    raise RuntimeError("No face detected in reference image")
+        img = Image.open(img_path).convert("RGB")
+        face = mtcnn(img)
 
-print(f"Detected {len(ref_embeddings)} face(s) in reference")
+        if face is None:
+            continue
 
-# ================== SEARCH & SAVE ==================
-output_root = Path(OUTPUT_DIR)
-output_root.mkdir(exist_ok=True)
+        face = face.unsqueeze(0).to(device)
 
-saved = set()
+        with torch.no_grad():
+            emb = facenet(face)
 
-for ref_idx, ref_emb in enumerate(ref_embeddings):
-    ref_dir = output_root / f"ref_face_{ref_idx}"
-    ref_dir.mkdir(exist_ok=True)
+        embeddings.append(emb.cpu().numpy()[0])
 
-    for i, item in enumerate(stored):
-        sim = cosine_similarity(ref_emb, stored_embeddings[i])
+    if not embeddings:
+        raise RuntimeError("No face detected in reference images")
 
-        if sim >= SIMILARITY_THRESHOLD:
-            src = Path(INPUT_IMAGES_DIR) / item["image"]
+    return np.mean(embeddings, axis=0)
 
-            if not src.exists():
-                continue
 
-            # evita copiar a mesma imagem várias vezes
-            key = (ref_idx, src.name)
-            if key in saved:
-                continue
+def find_matching_images(embeddings_file, reference_embedding, threshold):
+    with open(embeddings_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-            dst = ref_dir / src.name
-            shutil.copy2(src, dst)
+    matched_images = set()
 
-            saved.add(key)
+    for item in data:
+        emb = np.array(item["embedding"])
+        sim = cosine_similarity(reference_embedding, emb)
 
-            print(
-                f"[SAVED] ref_face {ref_idx} ← {src.name} "
-                f"(sim={sim:.3f})"
-            )
+        if sim >= threshold:
+            matched_images.add(item["image"])
 
-print(f"\nTotal images saved: {len(saved)}")
+    return sorted(matched_images)
+
+
+def download_images(images_source, selected_names, output_dir, img_type, workers=8):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with open(images_source, "r", encoding="utf-8") as f:
+        source = json.load(f)
+
+    index = {item["filename"] + ".jpg": item for item in source}
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def download(name):
+        if name not in index:
+            return f"[SKIP] {name} not found in images_source"
+
+        item = index[name]
+
+        if img_type not in item:
+            return f"[SKIP] {name} has no '{img_type}'"
+
+        out_path = output_dir / name
+        if out_path.exists():
+            return f"[SKIP] {name} exists"
+
+        try:
+            r = requests.get(item[img_type], timeout=30)
+            r.raise_for_status()
+            out_path.write_bytes(r.content)
+            return f"[OK] {name}"
+        except Exception as e:
+            return f"[ERROR] {name}: {e}"
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(download, n) for n in selected_names]
+        for f in as_completed(futures):
+            print(f.result())
+
+def main():
+    args = parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("Building reference embedding...")
+    ref_emb = build_reference_embedding(args.reference_dir, device)
+
+    print("Searching for matches...")
+    matched = find_matching_images(
+        args.embeddings,
+        ref_emb,
+        args.threshold
+    )
+
+    print(f"Matched images: {len(matched)}")
+
+    if not matched:
+        print("No matches found.")
+        return
+
+    print("Downloading matched images...")
+    download_images(
+        args.images_source,
+        matched,
+        Path(args.output_dir),
+        args.type,
+        args.workers
+    )
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
